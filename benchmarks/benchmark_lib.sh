@@ -160,7 +160,7 @@ NVIDIA_GPU_MONITOR_QUERY="timestamp,index,power.draw,temperature.gpu,clocks.curr
 export GPU_METRICS_CSV
 
 # Start background GPU monitoring that logs metrics every second to CSV.
-# Auto-detects NVIDIA (nvidia-smi) or AMD (amd-smi) GPUs.
+# Auto-detects NVIDIA (nvidia-smi), AMD (amd-smi), or MetaX (mx-smi) GPUs.
 # Usage: start_gpu_monitor [--output /path/to/output.csv] [--interval 1]
 start_gpu_monitor() {
     local output="$GPU_METRICS_CSV"
@@ -205,9 +205,22 @@ start_gpu_monitor() {
         _write_amd_smi_sidecar "${output%.csv}_energy_start.csv" metric -E --csv
         _write_amd_smi_sidecar "${output%.csv}_identity.json" static --json
         echo "[GPU Monitor] Started AMD (PID=$GPU_MONITOR_PID, interval=${interval}s, output=$output)"
+    elif command -v mx-smi &>/dev/null; then
+        GPU_MONITOR_VENDOR="metax"
+        # mx-smi only streams to a file (-o) and -l takes milliseconds; -t is
+        # not allowed together with -o. The native header (deviceId, "power
+        # [W]") is not understood by the power aggregator, so the stream lands
+        # in a raw sidecar that stop_gpu_monitor normalizes to
+        # timestamp,index,power_w before the benchmark result is written.
+        mx-smi --show-board-power --show-temperature --show-usage \
+            -l "$(( interval * 1000 ))" -o "${output%.csv}_raw.csv" >/dev/null 2>&1 &
+        GPU_MONITOR_PID=$!
+        # Static identity snapshot for audit; the power pipeline never reads it.
+        mx-smi > "${output%.csv}_identity.txt" 2>/dev/null || rm -f "${output%.csv}_identity.txt"
+        echo "[GPU Monitor] Started MetaX (PID=$GPU_MONITOR_PID, interval=${interval}s, output=$output)"
     else
         GPU_MONITOR_VENDOR=""
-        echo "[GPU Monitor] No GPU monitoring tool found (nvidia-smi or amd-smi), skipping"
+        echo "[GPU Monitor] No GPU monitoring tool found (nvidia-smi, amd-smi, or mx-smi), skipping"
         return 0
     fi
 }
@@ -224,7 +237,9 @@ stop_gpu_monitor() {
         # tick in the same second as the window end still fails bracketing —
         # the stream needs a tick at the NEXT whole second (measured on MI355X:
         # end=...153.325 vs last sample ...153.0).
-        if [[ "$GPU_MONITOR_VENDOR" == "amd" ]]; then
+        # AMD and MetaX stamp wall-clock seconds; a final tick must land after
+        # the window end, so let the stream emit one more interval before kill.
+        if [[ "$GPU_MONITOR_VENDOR" == "amd" || "$GPU_MONITOR_VENDOR" == "metax" ]]; then
             sleep $(( ${GPU_MONITOR_INTERVAL:-1} + 2 ))
         fi
         kill "$GPU_MONITOR_PID" 2>/dev/null
@@ -240,6 +255,12 @@ stop_gpu_monitor() {
             amd)
                 _repair_truncated_gpu_metrics_tail || true
                 _write_amd_smi_sidecar "${GPU_METRICS_CSV%.csv}_energy_end.csv" metric -E --csv
+                ;;
+            metax)
+                _repair_metax_gpu_metrics_tail
+                _normalize_metax_gpu_metrics "${GPU_METRICS_CSV%.csv}_raw.csv" "$GPU_METRICS_CSV" ||
+                    echo "[GPU Monitor] Warning: MetaX metrics normalization failed" >&2
+                rm -f "${GPU_METRICS_CSV%.csv}_raw.csv"
                 ;;
         esac
         echo "[GPU Monitor] Stopped (PID=$GPU_MONITOR_PID)"
@@ -271,6 +292,24 @@ _repair_truncated_gpu_metrics_tail() {
     return 0
 }
 
+# Drop a partial trailing row from the raw metax telemetry when the monitor
+# dies mid-write; the normalized stream is only ever rewritten from this file.
+_repair_metax_gpu_metrics_tail() {
+    local raw_metrics="${GPU_METRICS_CSV%.csv}_raw.csv"
+    local repaired_metrics="${raw_metrics}.repair.$$"
+    if [[ -s "$raw_metrics" ]] &&
+        ! tail -c 1 "$raw_metrics" | grep -q '^$'; then
+        if sed '$d' "$raw_metrics" > "$repaired_metrics" &&
+            mv "$repaired_metrics" "$raw_metrics"; then
+            echo "[GPU Monitor] Dropped truncated trailing sample"
+        else
+            rm -f "$repaired_metrics"
+            echo "[GPU Monitor] Warning: could not repair truncated metax sample" >&2
+        fi
+    fi
+    return 0
+}
+
 # Write one best-effort amd-smi snapshot; remove the file rather than keep a
 # partial one when the invocation fails.
 _write_amd_smi_sidecar() {
@@ -280,6 +319,44 @@ _write_amd_smi_sidecar() {
         rm -f "$out"
         echo "[GPU Monitor] Warning: amd-smi $1 sidecar failed" >&2
     fi
+}
+
+# Rewrite the raw mx-smi stream as timestamp,index,power_w so the generic power
+# aggregator's header detection (time/power/gpu-index columns) matches.
+_normalize_metax_gpu_metrics() {
+    local raw_metrics="$1"
+    local output="$2"
+    if [[ ! -s "$raw_metrics" ]]; then
+        return 1
+    fi
+    python3 - "$raw_metrics" "$output" <<'PY'
+import csv
+import sys
+
+raw_path, out_path = sys.argv[1], sys.argv[2]
+with open(raw_path, newline="", encoding="utf-8", errors="replace") as f:
+    reader = csv.reader(f)
+    header = next(reader, None)
+    if header is None:
+        raise ValueError("empty raw metax telemetry")
+    timestamp_i = header.index("timestamp")
+    device_i = header.index("deviceId")
+    power_i = next(
+        (i for i, name in enumerate(header) if name.lower().startswith("power")), None
+    )
+    if power_i is None:
+        raise ValueError("no power column in metax telemetry header")
+    last = max(timestamp_i, device_i, power_i)
+    with open(out_path, "w", newline="", encoding="utf-8") as out:
+        writer = csv.writer(out)
+        writer.writerow(["timestamp", "index", "power_w"])
+        for row in reader:
+            if len(row) <= last:
+                continue
+            writer.writerow(
+                [row[timestamp_i], row[device_i].rsplit("#", 1)[-1], row[power_i]]
+            )
+PY
 }
 
 # Block until the GPUs have released a prior job's memory before starting a run.
