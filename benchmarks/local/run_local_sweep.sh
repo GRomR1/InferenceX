@@ -13,18 +13,29 @@
 #   IMAGE=cr.metax-tech.com/.../vllm-metax:0.23.0-... \
 #   bash benchmarks/local/run_local_sweep.sh
 
-set -euo pipefail
+set -eo pipefail
 
 LOCAL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$LOCAL_DIR/../.." && pwd)"
 LAUNCHER="${LAUNCHER:-$REPO_ROOT/benchmarks/single_node/fixed_seq_len/qwen3.8_int8_c500.sh}"
 
-for var in MODEL RUNNER_TYPE MODEL_PREFIX FRAMEWORK PRECISION TP ISL OSL IMAGE; do
-    if [[ -z "${!var:-}" ]]; then
-        echo "Error: $var is required" >&2
+check_env_vars() {
+    local missing_vars=()
+    for var_name in "$@"; do
+        if [[ -z "${!var_name:-}" ]]; then
+            missing_vars+=("$var_name")
+        fi
+    done
+    if [[ ${#missing_vars[@]} -gt 0 ]]; then
+        echo "Error: The following required environment variables are not set:" >&2
+        for var in "${missing_vars[@]}"; do
+            echo "  - $var" >&2
+        done
         exit 1
     fi
-done
+}
+
+check_env_vars MODEL RUNNER_TYPE MODEL_PREFIX FRAMEWORK PRECISION TP ISL OSL IMAGE
 
 SPEC_DECODING="${SPEC_DECODING:-none}"
 DISAGG="${DISAGG:-false}"
@@ -63,24 +74,42 @@ echo "Launcher: $LAUNCHER"
 echo "Results: $RESULTS_DIR"
 echo "Concurrencies: $CONC_LIST"
 
+# A reused results directory must not feed stale points into this invocation:
+# drop previous canonical per-point artifacts and rebuild the batch directory.
+AGG_DIR="$RESULTS_DIR/agg"
+rm -f "$RESULTS_DIR"/agg_bmk_*.json
+rm -rf "$AGG_DIR"
+mkdir -p "$AGG_DIR"
+
 FAILED_POINTS=()
+record_failed_point() {
+    local conc="$1"
+    case " ${FAILED_POINTS[*]:-} " in
+        *" $conc "*) ;;
+        *) FAILED_POINTS+=("$conc") ;;
+    esac
+}
+
 for CONC in $CONC_LIST; do
     export CONC
     export RESULT_FILENAME="bmk_${MODEL_PREFIX}_${PRECISION}_${RUNNER_TYPE}_c${CONC}_gpus_${GPU_TOTAL}"
     export SERVER_LOG="$RESULTS_DIR/server_c${CONC}.log"
     echo "=== Point CONC=$CONC RESULT_FILENAME=$RESULT_FILENAME"
     if ! bash "$LAUNCHER"; then
-        echo "=== Point CONC=$CONC failed" >&2
-        FAILED_POINTS+=("$CONC")
+        echo "=== Point CONC=$CONC failed (launcher)" >&2
+        record_failed_point "$CONC"
         continue
     fi
-    python3 -m infx.results.fixed_sequence ||
+    # A point whose raw client JSON exists but fails normalization must not
+    # silently drop out of the batch, so track it like a launcher failure.
+    if ! python3 -m infx.results.fixed_sequence; then
         echo "=== Aggregation failed for $RESULT_FILENAME" >&2
+        record_failed_point "$CONC"
+        continue
+    fi
 done
 
 # Batch aggregation over the canonical per-point results only.
-AGG_DIR="$RESULTS_DIR/agg"
-mkdir -p "$AGG_DIR"
 if ls agg_bmk_*.json >/dev/null 2>&1; then
     cp -f agg_bmk_*.json "$AGG_DIR/"
 else
@@ -89,11 +118,20 @@ fi
 python3 -m infx.results.collect_results "$AGG_DIR" "$RUN_NAME"
 
 if [[ -n "${BASELINES_DIR:-}" ]]; then
+    # local_compare exits 1 for the soft "no baseline matched" outcome; any
+    # other non-zero is a real failure and propagates.
+    set +e
     python3 -m infx.results.local_compare \
         --run "$RESULTS_DIR/agg_${RUN_NAME}.json" \
         --baselines "$BASELINES_DIR" \
         --out "$RESULTS_DIR/comparison.md"
-    echo "Comparison: $RESULTS_DIR/comparison.md"
+    compare_rc=$?
+    set -e
+    if [[ "$compare_rc" -ne 0 && "$compare_rc" -ne 1 ]]; then
+        echo "Error: local_compare failed with rc=$compare_rc" >&2
+        exit "$compare_rc"
+    fi
+    echo "Comparison: $RESULTS_DIR/comparison.md (rc=$compare_rc)"
 fi
 
 if (( ${#FAILED_POINTS[@]} > 0 )); then

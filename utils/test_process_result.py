@@ -1258,6 +1258,93 @@ fi
         identity = json.loads((tmp_path / "gpu_metrics_identity.json").read_text())
         assert identity == {"gpu_data": []}
 
+    def test_start_stop_gpu_monitor_metax_lifecycle(self, tmp_path):
+        """The raw mx-smi stream is normalized to timestamp,index,power_w."""
+        fake_bin = tmp_path / "bin"
+        fake_bin.mkdir()
+        header = (
+            "timestamp,deviceId,dieId,deviceName,bdfId,power [W],"
+            "temperature.hotspot [C],utilization.GPU [%]"
+        )
+        row_85 = "2026/9/15 21:02:33.385860,GPU#0,-,MXC500,0000:06:00.0,85.5,66.0,58"
+        row_89 = "2026/9/15 21:02:33.892721,GPU#0,-,MXC500,0000:06:00.0,89.1,64.0,57"
+        fake_mx_smi = fake_bin / "mx-smi"
+        fake_mx_smi.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -e\n"
+            'if [[ "$*" == *"-o "* ]]; then\n'
+            '    out="$(echo "$*" | sed -n \'s/.*-o //p\')"\n'
+            f"    printf '%s\\n' {header!r} > \"$out\"\n"
+            "    while :; do\n"
+            f"        printf '%s\\n' {row_85!r} >> \"$out\"\n"
+            f"        printf '%s\\n' {row_89!r} >> \"$out\"\n"
+            "        sleep 0.01\n"
+            "    done\n"
+            "fi\n"
+            "printf 'MX-SMI identity snapshot: 1 device\\n'\n"
+        )
+        fake_mx_smi.chmod(0o755)
+        metrics = tmp_path / "gpu_metrics.csv"
+        raw = tmp_path / "gpu_metrics_raw.csv"
+        benchmark_lib = Path(__file__).parents[1] / "benchmarks/benchmark_lib.sh"
+        script = f"""
+source {str(benchmark_lib)!r}
+# Wait for observable pipeline output instead of a fixed sampling delay.
+sleep() {{
+    for _ in $(seq 1 500); do
+        if [[ -f {str(raw)!r} ]] && [[ $(wc -l < {str(raw)!r}) -ge 3 ]]; then
+            return 0
+        fi
+        command sleep 0.01
+    done
+    echo "metax monitor did not emit samples" >&2
+    exit 1
+}}
+start_gpu_monitor --output {str(metrics)!r} --interval 1
+monitor_pid=$GPU_MONITOR_PID
+stop_gpu_monitor
+if kill -0 "$monitor_pid" 2>/dev/null; then
+    echo "monitor survived stop_gpu_monitor" >&2
+    exit 1
+fi
+"""
+        env = {
+            "PATH": f"{fake_bin}:/usr/bin:/bin",
+            "PYTHONDONTWRITEBYTECODE": "1",
+        }
+
+        proc = subprocess.Popen(
+            ["bash", "-c", script],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        try:
+            _, stderr = proc.communicate(timeout=10)
+        finally:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            proc.communicate()
+
+        assert proc.returncode == 0, stderr
+        lines = metrics.read_text().splitlines()
+        assert lines[0] == "timestamp,index,power_w"
+        # Hand-computed: "GPU#0" collapses to index "0"; the power column
+        # passes through untouched.
+        data_rows = [line.split(",") for line in lines[1:] if line]
+        assert len(data_rows) >= 2
+        assert all(row[1] == "0" for row in data_rows)
+        assert {row[2] for row in data_rows} <= {"85.5", "89.1"}
+        assert "2026/9/15 21:02:33.385860,0,85.5" in {",".join(row) for row in data_rows}
+        # The raw sidecar is consumed, and the identity snapshot survives.
+        assert not raw.exists()
+        identity = tmp_path / "gpu_metrics_identity.txt"
+        assert identity.read_text() == "MX-SMI identity snapshot: 1 device\n"
+
 
 # =============================================================================
 # Integration: multinode power aggregation patches the agg JSON

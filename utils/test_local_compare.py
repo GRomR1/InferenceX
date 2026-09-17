@@ -19,6 +19,7 @@ RUN_POINT = {
     "osl": 512,
     "conc": 1,
     "hw": "metax-c500",
+    "tp": 1,
     "tput_per_gpu": 10.0,
     "output_tput_per_gpu": 4.0,
     "median_ttft": 2.0,
@@ -33,6 +34,7 @@ BASELINE_POINT = {
     **RUN_POINT,
     "infmax_model_prefix": "qwen3.8",
     "hw": "h100",
+    "tp": 8,
     "tput_per_gpu": 20.0,
     "output_tput_per_gpu": 8.0,
     "median_ttft": 1.0,
@@ -68,9 +70,15 @@ def test_compare_points_computes_deltas_by_hand():
 
 
 def test_match_key_is_case_insensitive_and_conc_scoped():
-    assert match_key(RUN_POINT) == match_key(BASELINE_POINT)
+    # Hand-computed; RUN_POINT's prefix is intentionally capitalized to prove
+    # the key lowercases it.
+    assert match_key(RUN_POINT) == (
+        "qwen3.8", "vllm", "int8", "none", False, 1024, 512, 1,
+    )
     other_conc = {**RUN_POINT, "conc": 2}
-    assert match_key(other_conc) != match_key(RUN_POINT)
+    assert match_key(other_conc) == (
+        "qwen3.8", "vllm", "int8", "none", False, 1024, 512, 2,
+    )
 
 
 def test_load_points_and_render_markdown(tmp_path: Path):
@@ -82,9 +90,10 @@ def test_load_points_and_render_markdown(tmp_path: Path):
     baseline_path.write_text(json.dumps(batch))
 
     points = load_points(baseline_path)
+    # Hand-computed (prefix, framework, precision, spec, disagg, isl, osl, conc).
     assert set(points) == {
-        match_key(BASELINE_POINT),
-        match_key({**BASELINE_POINT, "conc": 2}),
+        ("qwen3.8", "vllm", "int8", "none", False, 1024, 512, 1),
+        ("qwen3.8", "vllm", "int8", "none", False, 1024, 512, 2),
     }
 
     unmatched = {**RUN_POINT, "osl": 1024}
@@ -94,8 +103,10 @@ def test_load_points_and_render_markdown(tmp_path: Path):
 
     assert matched is True
     assert "No baseline matched this point." in report
+    # tp is surfaced, not a matching key: tp1 run matches the tp8 baseline.
+    assert "run [metax-c500 tp1]" in report
     # conc=1 point: run tput 10.0 vs baseline 20.0 -> -10.0000 (-50.0%)
     assert "| Total throughput (tok/s per GPU) | 10 | 20 | -10.0000 (-50.0%) |" in report
     # missing baseline metric renders as dashes, not a number
     assert "| Energy per total token (J) | 0.5 | - | - |" in report
-    assert "h100 vllm (h100_vllm.json)" in report
+    assert "h100 tp8 vllm (h100_vllm.json)" in report

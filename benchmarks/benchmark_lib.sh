@@ -721,7 +721,8 @@ EOF
 
 
 # Poll an HTTP endpoint while streaming the owning process log.
-# Required: --endpoint, --log, --pid. A zero timeout waits indefinitely.
+# Required: --endpoint, --log, and --pid unless --no-supervision is given.
+# A zero timeout waits indefinitely (only legal when a pid is supervised).
 wait_for_ready() {
     set +x
     local endpoint=""
@@ -729,6 +730,7 @@ wait_for_ready() {
     local process_pid=""
     local sleep_interval=5
     local timeout=0
+    local supervise=1
 
     while [[ $# -gt 0 ]]; do
         case $1 in
@@ -752,6 +754,10 @@ wait_for_ready() {
                 timeout="$2"
                 shift 2
                 ;;
+            --no-supervision)
+                supervise=0
+                shift
+                ;;
             *)
                 echo "Unknown parameter: $1"
                 return 1
@@ -767,8 +773,12 @@ wait_for_ready() {
         echo "Error: --log is required"
         return 1
     fi
-    if [[ -z "$process_pid" ]]; then
-        echo "Error: --pid is required"
+    if [[ "$supervise" -eq 1 && -z "$process_pid" ]]; then
+        echo "Error: --pid is required unless --no-supervision is given"
+        return 1
+    fi
+    if [[ "$supervise" -eq 0 && "$timeout" -eq 0 ]]; then
+        echo "Error: --no-supervision requires a positive --timeout"
         return 1
     fi
     if [[ ! "$sleep_interval" =~ ^[1-9][0-9]*$ ]]; then
@@ -786,7 +796,7 @@ wait_for_ready() {
     fi
 
     while [[ ! -f "$process_log" ]]; do
-        if ! kill -0 "$process_pid" 2>/dev/null; then
+        if [[ "$supervise" -eq 1 ]] && ! kill -0 "$process_pid" 2>/dev/null; then
             echo "Process died before creating $process_log." >&2
             exit 1
         fi
@@ -800,7 +810,7 @@ wait_for_ready() {
     tail -f -n +1 "$process_log" &
     local tail_pid=$!
     until curl --output /dev/null --silent --fail "$endpoint"; do
-        if ! kill -0 "$process_pid" 2>/dev/null; then
+        if [[ "$supervise" -eq 1 ]] && ! kill -0 "$process_pid" 2>/dev/null; then
             echo "Process died before $endpoint became ready." >&2
             kill "$tail_pid" 2>/dev/null || true
             exit 1
@@ -821,6 +831,8 @@ wait_for_server_ready() {
     local server_log=""
     local server_pid=""
     local sleep_interval=5
+    local timeout=0
+    local no_supervision=0
 
     while [[ $# -gt 0 ]]; do
         case $1 in
@@ -828,20 +840,38 @@ wait_for_server_ready() {
             --server-log) server_log="$2"; shift 2 ;;
             --server-pid) server_pid="$2"; shift 2 ;;
             --sleep-interval) sleep_interval="$2"; shift 2 ;;
+            --timeout) timeout="$2"; shift 2 ;;
+            --no-supervision) no_supervision=1; shift ;;
             *) echo "Unknown parameter: $1"; return 1 ;;
         esac
     done
 
-    if [[ -z "$port" || -z "$server_log" || -z "$server_pid" ]]; then
-        echo "Error: --port, --server-log, and --server-pid are required"
+    if [[ -z "$port" || -z "$server_log" ]]; then
+        echo "Error: --port and --server-log are required"
+        return 1
+    fi
+    if [[ "$no_supervision" -eq 0 && -z "$server_pid" ]]; then
+        echo "Error: --server-pid is required unless --no-supervision is given"
         return 1
     fi
 
-    wait_for_ready \
-        --endpoint "http://0.0.0.0:${port}/health" \
-        --log "$server_log" \
-        --pid "$server_pid" \
-        --sleep-interval "$sleep_interval" || return $?
+    local ready_args=(
+        --endpoint "http://0.0.0.0:${port}/health"
+        --log "$server_log"
+        --sleep-interval "$sleep_interval"
+        --timeout "$timeout"
+    )
+    if [[ "$no_supervision" -eq 1 ]]; then
+        # The server's lifecycle is owned by the caller, so poll /health only.
+        ready_args+=(--no-supervision)
+    else
+        ready_args+=(--pid "$server_pid")
+    fi
+    wait_for_ready "${ready_args[@]}" || return $?
+    if [[ "$no_supervision" -eq 1 ]]; then
+        # No owned process to snapshot; run_server_client runs directly.
+        return 0
+    fi
     INFERENCEX_SERVER_STATE=$(mktemp /tmp/inferencex-server-state.XXXXXX) || return 1
     PYTHONPATH="$INFERENCEX_REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 -m infx.bench_serving.server_watch capture --pid "$server_pid" \
         > "$INFERENCEX_SERVER_STATE" || return 1

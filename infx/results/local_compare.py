@@ -8,8 +8,12 @@ plain JSON files in the same canonical format produced by
 the public InferenceX database or from other local runs.
 
 Points are matched on (model prefix, framework, precision, spec decoding,
-disaggregation, ISL, OSL, concurrency). Throughput and intvty are
-higher-is-better; latencies and energy are lower-is-better.
+disaggregation, ISL, OSL, concurrency). Topology (tp) is intentionally not
+part of the key so that a 1x local accelerator can be compared against
+multi-GPU baselines, because throughput metrics are per-GPU; it is surfaced
+in the run column header and every baseline column label instead.
+Throughput and intvty are higher-is-better; latencies and energy are
+lower-is-better.
 """
 
 from __future__ import annotations
@@ -72,9 +76,7 @@ def load_points(path: Path) -> dict[tuple[Any, ...], dict[str, Any]]:
     return out
 
 
-def compare_points(
-    run_point: dict[str, Any], baseline_point: dict[str, Any]
-) -> dict[str, Any]:
+def compare_points(run_point: dict[str, Any], baseline_point: dict[str, Any]) -> dict[str, Any]:
     """Per-metric run-vs-baseline numbers for one matched pair of points.
 
     Delta is run minus baseline; delta_pct is relative to the baseline. Both
@@ -117,10 +119,20 @@ def _fmt_delta(entry: dict[str, Any]) -> str:
     return f"{entry['delta']:+.4f} ({entry['delta_pct']:+.1f}%)"
 
 
+def _topology_label(point: dict[str, Any]) -> str:
+    """Short parallelism label; disagg points show prefill/decode separately."""
+    if point.get("disagg"):
+        return f"tp{point.get('prefill_tp', '-')}p/tp{point.get('decode_tp', '-')}d"
+    tp = point.get("tp")
+    if isinstance(tp, (int, float)) and not isinstance(tp, bool):
+        return f"tp{int(tp)}"
+    return "tp-"
+
+
 def _baseline_label(path: Path, point: dict[str, Any]) -> str:
     hw = point.get("hw", "unknown-hw")
     framework = point.get("framework", "unknown-fw")
-    return f"{hw} {framework} ({path.name})"
+    return f"{hw} {_topology_label(point)} {framework} ({path.name})"
 
 
 def render_markdown(
@@ -144,9 +156,7 @@ def render_markdown(
         for baseline_path, baseline_points in baselines:
             baseline_point = baseline_points.get(key)
             if baseline_point is not None:
-                matches.append(
-                    (_baseline_label(baseline_path, baseline_point), baseline_point)
-                )
+                matches.append((_baseline_label(baseline_path, baseline_point), baseline_point))
         lines.append(f"## ISL {isl} / OSL {osl} / concurrency {conc}")
         lines.append("")
         if not matches:
@@ -155,10 +165,10 @@ def render_markdown(
             continue
         matched_any = True
         comparisons = [
-            compare_points(run_point, baseline_point)
-            for _label, baseline_point in matches
+            compare_points(run_point, baseline_point) for _label, baseline_point in matches
         ]
-        header = ["Metric", run_name]
+        run_identity = f"{run_name} [{run_point.get('hw', '?')} {_topology_label(run_point)}]"
+        header = ["Metric", run_identity]
         for label, _baseline_point in matches:
             header.append(label)
             header.append(f"\u0394 vs {label}")
@@ -195,9 +205,7 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="Write the markdown report here instead of stdout",
     )
-    parser.add_argument(
-        "--name", default=None, help="Label for this run (default: run file stem)"
-    )
+    parser.add_argument("--name", default=None, help="Label for this run (default: run file stem)")
     args = parser.parse_args(argv)
 
     if not args.run.is_file():
