@@ -19,21 +19,9 @@ LOCAL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$LOCAL_DIR/../.." && pwd)"
 LAUNCHER="${LAUNCHER:-$REPO_ROOT/benchmarks/single_node/fixed_seq_len/qwen3.8_int8_c500.sh}"
 
-check_env_vars() {
-    local missing_vars=()
-    for var_name in "$@"; do
-        if [[ -z "${!var_name:-}" ]]; then
-            missing_vars+=("$var_name")
-        fi
-    done
-    if [[ ${#missing_vars[@]} -gt 0 ]]; then
-        echo "Error: The following required environment variables are not set:" >&2
-        for var in "${missing_vars[@]}"; do
-            echo "  - $var" >&2
-        done
-        exit 1
-    fi
-}
+# This orchestrator only needs required-input validation, not benchmark
+# initialization, so load the shared helper in validation-only mode.
+source "$REPO_ROOT/benchmarks/benchmark_lib.sh" --validation-only
 
 check_env_vars MODEL RUNNER_TYPE MODEL_PREFIX FRAMEWORK PRECISION TP ISL OSL IMAGE
 
