@@ -127,7 +127,7 @@ Everything lands in `~/inferencex-local-bench/results/<RUN_NAME>/`
 | `PRECISION` | Precision: `int8` / `fp8` / `bf16` / `fp4` ... |
 | `TP` | Tensor parallelism (accelerators per node) |
 | `ISL`, `OSL` | Fixed input/output sequence lengths (synthetic load; `RANDOM_RANGE_RATIO=0.0` = no variation) |
-| `IMAGE` | Vendor engine image tag (lands in the result `image` field and in the docker run) |
+| `IMAGE` | Vendor engine image tag — the result `image` provenance in **both** modes. Docker-launch mode runs it; existing-server mode records it (use the tag the running server was started from) |
 
 ### 2.3 Orchestrator parameters (optional)
 
@@ -169,9 +169,12 @@ If vLLM already serves the model (e.g. your working container), benchmark it
 without starting a new one:
 
 ```bash
-# OPENAI_API_KEY is only needed if the server was started with --api-key
+# OPENAI_API_KEY is only needed if the server was started with --api-key.
+# IMAGE is still required: it records the engine-image provenance of the
+# result (use the tag the running server was started from).
 EXISTING_SERVER_PORT=8011 \
 OPENAI_API_KEY=<your-api-key> \
+IMAGE=<tag-the-running-server-was-started-from> \
 MODEL=<path-to-weights-for-the-tokenizer> \
 bash benchmarks/local/run_local_sweep.sh
 ```

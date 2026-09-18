@@ -794,6 +794,23 @@ wait_for_ready() {
     if [[ "$timeout" -gt 0 ]]; then
         deadline=$((SECONDS + timeout))
     fi
+    local probe_args=()
+    local remaining=0
+    # A single probe must not outlive the readiness budget: a server that
+    # accepts the connection and never answers must still be bounded.
+    _refresh_probe_args() {
+        probe_args=()
+        if [[ "$deadline" -gt 0 ]]; then
+            remaining=$(( deadline - SECONDS ))
+            if [[ "$remaining" -lt 1 ]]; then
+                remaining=1
+            fi
+            probe_args=(--max-time "$remaining")
+        else
+            probe_args=(--max-time "$sleep_interval")
+        fi
+    }
+    _refresh_probe_args
 
     while [[ ! -f "$process_log" ]]; do
         if [[ "$supervise" -eq 1 ]] && ! kill -0 "$process_pid" 2>/dev/null; then
@@ -814,7 +831,7 @@ wait_for_ready() {
 
     tail -f -n +1 "$process_log" &
     local tail_pid=$!
-    until curl --output /dev/null --silent --fail "$endpoint"; do
+    until curl --output /dev/null --silent --fail "${probe_args[@]}" "$endpoint"; do
         if [[ "$supervise" -eq 1 ]] && ! kill -0 "$process_pid" 2>/dev/null; then
             echo "Process died before $endpoint became ready." >&2
             kill "$tail_pid" 2>/dev/null || true
@@ -829,6 +846,8 @@ wait_for_ready() {
             return 1
         fi
         sleep "$sleep_interval"
+        # Rebound the next probe to the (possibly shrunk) wait budget.
+        _refresh_probe_args
     done
     kill "$tail_pid" 2>/dev/null || true
     wait "$tail_pid" 2>/dev/null || true

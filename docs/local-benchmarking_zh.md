@@ -117,7 +117,7 @@ launcher 失败或聚合失败都会把该并发记入失败点集合，sweep �
 | `PRECISION` | 精度：`int8` / `fp8` / `bf16` / `fp4` … |
 | `TP` | 张量并行（每节点加速卡数） |
 | `ISL`、`OSL` | 固定输入/输出序列长度（合成负载；`RANDOM_RANGE_RATIO=0.0` = 无变差） |
-| `IMAGE` | 厂商引擎镜像 tag（写入结果 `image` 字段并用于 docker 启动） |
+| `IMAGE` | 厂商引擎镜像 tag —— 两种模式都必填：docker 模式用它启动容器；已有服务模式只记录它作为结果 `image` 溯源（填运行中服务器的 tag） |
 
 ### 2.3 编排器参数（可选）
 
@@ -158,10 +158,13 @@ Launcher 内固定服务器参数：`--host 0.0.0.0 --port 8888
 若 vLLM 已在服务该模型（例如你的工作容器），可直接对它测试而不新起服务：
 
 ```bash
-# OPENAI_API_KEY 仅在服务器带 --api-key 启动时需要
+# OPENAI_API_KEY 仅在服务器带 --api-key 启动时需要。
+# IMAGE 仍然必填：它记录结果的引擎镜像来源（用运行中服务器的 tag），
+# 即使本模式不启动新容器。
 EXISTING_SERVER_PORT=8011 \
 OPENAI_API_KEY=<your-api-key> \
 MODEL=<tokenizer 用的权重路径> \
+IMAGE=cr.metax-tech.com/public-ai-release/maca/vllm-metax:0.23.0-maca.ai3.8.0.103-torch2.10-py312-ubuntu22.04-amd64 \
 bash benchmarks/local/run_local_sweep.sh
 ```
 

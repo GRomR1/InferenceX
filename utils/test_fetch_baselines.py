@@ -30,6 +30,47 @@ def _row(**overrides):
     return row
 
 
+def test_fetch_rows_encodes_reserved_characters_in_model(tmp_path, monkeypatch):
+    """A frontend name with space/&/# must be percent-encoded in the query."""
+    captured = {}
+
+    class _Response:
+        def __init__(self):
+            self.headers = {"Content-Encoding": "identity"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self):
+            return b"[]"
+
+    def _fake_urlopen(request, timeout):
+        captured["url"] = request.full_url
+        return _Response()
+
+    monkeypatch.setattr(
+        fetch_baselines.urllib.request, "urlopen", _fake_urlopen, raising=False
+    )
+
+    fetch_baselines.fetch_rows("Qwen 3.5 & Friends #2 (beta)")
+
+    url = captured["url"]
+    # Hand-computed: urlencode("Qwen 3.5 & Friends #2 (beta)") percent-encodes
+    # &, # and the parens and plus-encodes the spaces.
+    assert url == (
+        "https://inferencex.semianalysis.com/api/v1/benchmarks"
+        "?model=Qwen+3.5+%26+Friends+%232+%28beta%29"
+    )
+    value = url.split("model=", 1)[1]
+    # No raw reserved character may remain outside its %XX form.
+    assert "&" not in value.replace("%26", "")
+    assert "#" not in value
+    assert " " not in value
+
+
 def test_main_filters_groups_and_maps_canonical_fields(tmp_path, monkeypatch):
     rows = [
         _row(),

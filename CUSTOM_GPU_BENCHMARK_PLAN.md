@@ -57,9 +57,16 @@ Run entirely offline without GitHub Actions or internet access:
    - Vendor-specific runtime image is required because LLM serving depends on low-level device drivers and vendor kernel libraries (e.g. MetaX MACA, Huawei CANN, Intel Habana OneAPI).
    - Ensure the image contains an LLM serving engine implementing OpenAI-compatible REST API (`vllm serve` or vendor fork like `vllm-ascend`, `habana-ai/vllm`).
    - Package the image as a tarball (`docker save <image> -o image.tar`) and transfer it to the isolated host, then run `docker load -i image.tar`.
-3. **InferenceX Codebase Mounting:**
-   - Clone or copy this InferenceX repository onto the host and mount it into the container at `/workspace/InferenceX`.
-   - Ensure container Python has required client dependencies: `pip install pydantic pandas datasets aiohttp requests`.
+3. **InferenceX Codebase Placement (host-side client):**
+   - Clone or copy this InferenceX repository onto the host. The launcher, the
+     benchmark client, and the result processors all run in **host** python
+     (`run_local_sweep.sh` checks the imports and fails with a clear message
+     when they are missing); the repository is *not* mounted into the engine
+     container, which only mounts `$MODEL` read-only at the same path.
+   - Ensure the host Python (a project venv, e.g. `~/.venvs/inferencex-bench`)
+     has the client dependencies: `pip install aiohttp huggingface_hub numpy
+     tqdm transformers` (plus the Pydantic/NumPy/Pandas stack the result
+     processors use). Put its `bin/` first on `PATH` when running the sweep.
 
 ### Phase 2: Hardware Telemetry Adaptation (Optional Power Metrics)
 1. **Extend GPU Monitoring in `benchmarks/benchmark_lib.sh`:**
@@ -107,7 +114,7 @@ Create a dedicated standalone benchmark runner `benchmarks/single_node/fixed_seq
        --num-prompts "$((CONC * 10))" \
        --max-concurrency "$CONC" \
        --result-filename "$RESULT_FILENAME" \
-       --result-dir /workspace/results/ \
+       --result-dir "$RESULTS_DIR" \
        --trust-remote-code
      ```
    - Ensure `--request-rate inf` and `--ignore-eos` remain active (default inside `benchmark_lib.sh`).
@@ -136,7 +143,7 @@ Create a dedicated standalone benchmark runner `benchmarks/single_node/fixed_seq
      ```
    - This parses the raw client output, validates request outcomes, and generates `agg_<RESULT_FILENAME>.json`.
 2. **Batch Aggregation:**
-   - Run `python3 -m infx.results.collect_results /workspace/results/ <custom_run_name>` to combine all concurrency points into `agg_<custom_run_name>.json`.
+   - Run `python3 -m infx.results.collect_results <results_dir> <custom_run_name>` (the host-side `$RESULTS_DIR`, e.g. `~/inferencex-local-bench/results/<run_name>`; benchmarks create no directories under `/workspace`) to combine all concurrency points into `agg_<custom_run_name>.json`.
 
 ### Phase 5: Result Comparison and Ingestion
 1. **Local Comparison Mode (Air-gapped / Private):**

@@ -17,6 +17,7 @@ import argparse
 import gzip
 import json
 import sys
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -26,7 +27,9 @@ _USER_AGENT = "inferencex-local-bench/1.0"
 
 
 def fetch_rows(model: str) -> list[dict[str, Any]]:
-    url = f"{API_BASE}/benchmarks?model={model}"
+    # urlencode so reserved characters in a frontend name (space, &, #, ...)
+    # do not truncate the query or become extra parameters.
+    url = f"{API_BASE}/benchmarks?{urllib.parse.urlencode({'model': model})}"
     # S310: the scheme and host are pinned by the constant API_BASE above.
     request = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT})  # noqa: S310
     with urllib.request.urlopen(request, timeout=60) as response:  # noqa: S310

@@ -7,8 +7,9 @@
 # already-running server when EXISTING_SERVER_PORT is set. No Slurm, no GHA.
 #
 # Required environment: MODEL (absolute host path), TP, CONC, ISL, OSL,
-# RANDOM_RANGE_RATIO, RESULT_FILENAME, EP_SIZE. Docker-launch mode additionally
-# requires IMAGE (the vendor engine image tag recorded in the results).
+# RANDOM_RANGE_RATIO, RESULT_FILENAME, EP_SIZE, and IMAGE (the vendor engine
+# image tag recorded as the result's image provenance; in docker mode it is
+# also the container image, in existing-server mode it documents the server's).
 # Optional: PORT (default 8888), RESULT_DIR, SERVER_LOG, EXISTING_SERVER_PORT,
 # EXISTING_SERVER_PID (supervise an external server; unset means poll /health
 # only, bounded by EXISTING_SERVER_TIMEOUT, default 3600), OPENAI_API_KEY
@@ -27,7 +28,8 @@ check_env_vars \
     OSL \
     RANDOM_RANGE_RATIO \
     RESULT_FILENAME \
-    EP_SIZE
+    EP_SIZE \
+    IMAGE
 
 if [[ "$MODEL" != /* ]]; then hf download "$MODEL"; fi
 
@@ -48,9 +50,13 @@ start_gpu_monitor
 # repo's exit_after_background_process_cleanup pattern) and the monitor stop
 # is tracked here, so the trap does not rely on stop_gpu_monitor's internal
 # state reset for idempotency.
-METAX_CONTAINER_STARTED=0
 METAX_MONITOR_STOPPED=0
 METAX_CONTAINER_NAME="${METAX_CONTAINER_NAME:-inferencex-bench-$BASHPID}"
+# Docker writes the created container's ID here; on a failure (for example a
+# name collision with a pre-existing container) the file stays empty, and the
+# trap then removes nothing instead of a stranger's container.
+METAX_CIDFILE="$RESULT_DIR/.inferencex-container-$BASHPID.cid"
+rm -f "$METAX_CIDFILE"
 _on_exit() {
     trap - EXIT
     set +e
@@ -58,9 +64,8 @@ _on_exit() {
         stop_gpu_monitor
         METAX_MONITOR_STOPPED=1
     fi
-    if [[ "$METAX_CONTAINER_STARTED" -eq 1 ]]; then
-        docker rm -f "$METAX_CONTAINER_NAME" >/dev/null 2>&1
-        METAX_CONTAINER_STARTED=0
+    if [[ -s "$METAX_CIDFILE" ]]; then
+        docker rm -f "$(cat "$METAX_CIDFILE")" >/dev/null 2>&1
     fi
     return 0
 }
@@ -98,12 +103,14 @@ if [[ -n "${EXISTING_SERVER_PORT:-}" ]]; then
     }
     echo "Using existing server on port $PORT"
 else
-    check_env_vars IMAGE
     # IMAGE is the caller-owned engine image and the provenance recorded in
     # the results; METAX_VLLM_IMAGE is an explicit override only.
     METAX_VLLM_IMAGE="${METAX_VLLM_IMAGE:-$IMAGE}"
     set -x
+    # --cidfile records only the container this run created, so the EXIT trap
+    # can never remove a pre-existing container that lost a name race.
     docker run --rm --name "$METAX_CONTAINER_NAME" \
+        --cidfile "$METAX_CIDFILE" \
         --device /dev/mxcd --device /dev/dri \
         -v "$MODEL:$MODEL":ro \
         -p "$PORT:8888" \
@@ -121,7 +128,6 @@ else
             "${METAX_EXTRA_VLLM_ARGS[@]}" \
             > "$SERVER_LOG" 2>&1 &
     SERVER_PID=$!
-    METAX_CONTAINER_STARTED=1
     set +x
 
     wait_for_server_ready --port "$PORT" --server-log "$SERVER_LOG" --server-pid "$SERVER_PID" || {
