@@ -171,7 +171,7 @@ without starting a new one:
 ```bash
 # OPENAI_API_KEY is only needed if the server was started with --api-key
 EXISTING_SERVER_PORT=8011 \
-OPENAI_API_KEY=opencode-key \
+OPENAI_API_KEY=<your-api-key> \
 MODEL=<path-to-weights-for-the-tokenizer> \
 bash benchmarks/local/run_local_sweep.sh
 ```

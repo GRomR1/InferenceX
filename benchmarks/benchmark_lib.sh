@@ -802,7 +802,12 @@ wait_for_ready() {
         fi
         if [[ "$deadline" -gt 0 && "$SECONDS" -ge "$deadline" ]]; then
             echo "Timed out waiting for $endpoint." >&2
-            exit 1
+            # Supervised callers rely on the exit; no-supervision callers
+            # (externally owned servers) want a plain return like validation.
+            if [[ "$supervise" -eq 1 ]]; then
+                exit 1
+            fi
+            return 1
         fi
         sleep 1
     done
@@ -818,7 +823,10 @@ wait_for_ready() {
         if [[ "$deadline" -gt 0 && "$SECONDS" -ge "$deadline" ]]; then
             echo "Timed out waiting for $endpoint." >&2
             kill "$tail_pid" 2>/dev/null || true
-            exit 1
+            if [[ "$supervise" -eq 1 ]]; then
+                exit 1
+            fi
+            return 1
         fi
         sleep "$sleep_interval"
     done

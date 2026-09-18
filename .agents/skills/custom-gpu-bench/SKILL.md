@@ -19,7 +19,7 @@ end-to-end; the checklist below generalizes to the next vendor.
 - Validating a new vendor image or model before it goes into
   `configs/runners.yaml` and the public sweeps.
 
-## Reference layout (already merged)
+## Reference layout
 
 | Piece | File |
 | --- | --- |
@@ -27,7 +27,8 @@ end-to-end; the checklist below generalizes to the next vendor.
 | Single-point launcher (docker or existing server) | `benchmarks/single_node/fixed_seq_len/qwen3.8_int8_c500.sh` |
 | Sweep orchestrator (conc loop, aggregation, comparison) | `benchmarks/local/run_local_sweep.sh` |
 | Offline comparison vs baseline JSONs | `infx/results/local_compare.py` + `utils/test_local_compare.py` |
-| Export published rows as baselines (internet once) | `infx/results/fetch_baselines.py` |
+| Export published rows as baselines (internet once) | `infx/results/fetch_baselines.py` (+ `utils/test_fetch_baselines.py`) |
+| Contributor guide (EN/ZH, indexed) | `docs/local-benchmarking.md` / `docs/local-benchmarking_zh.md` |
 
 Results live under `~/inferencex-local-bench/results/<run>/`; host client venv is
 `~/.venvs/inferencex-bench` (needs `aiohttp huggingface_hub numpy tqdm transformers`;
@@ -103,5 +104,8 @@ then `read -r -a VAR <<< "$VAR_STR"`. This bit `METAX_EXTRA_VLLM_ARGS`.
    (model prefix, framework, precision, spec decoding, disagg, isl, osl, conc) —
    pick ISL/OSL that exist in the published data (check
    `/api/v1/availability`) or the comparison is a no-match by construction.
+   Export the baselines with `--model-prefix <the run's MODEL_PREFIX>` so the
+   stamped `infmax_model_prefix` can actually equal the run's identity (the
+   API's own model slug rarely does).
 4. `uvx ruff check infx && uvx ruff format --check infx` plus the new/affected
    pytest files before declaring done.

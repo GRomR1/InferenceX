@@ -44,15 +44,23 @@ start_gpu_monitor
 
 # Idempotent cleanup for both the explicit stop below and the failure paths
 # (server death or readiness timeout exits the script before it would
-# otherwise reach stop_gpu_monitor). stop_gpu_monitor is itself a no-op once
-# the stream has been stopped.
+# otherwise reach stop_gpu_monitor). The trap is disabled before running (the
+# repo's exit_after_background_process_cleanup pattern) and the monitor stop
+# is tracked here, so the trap does not rely on stop_gpu_monitor's internal
+# state reset for idempotency.
 METAX_CONTAINER_STARTED=0
+METAX_MONITOR_STOPPED=0
 METAX_CONTAINER_NAME="${METAX_CONTAINER_NAME:-inferencex-bench-$BASHPID}"
 _on_exit() {
+    trap - EXIT
     set +e
-    stop_gpu_monitor
+    if [[ "$METAX_MONITOR_STOPPED" -eq 0 ]]; then
+        stop_gpu_monitor
+        METAX_MONITOR_STOPPED=1
+    fi
     if [[ "$METAX_CONTAINER_STARTED" -eq 1 ]]; then
         docker rm -f "$METAX_CONTAINER_NAME" >/dev/null 2>&1
+        METAX_CONTAINER_STARTED=0
     fi
     return 0
 }
@@ -146,4 +154,5 @@ if [ "${RUN_EVAL}" = "true" ]; then
 fi
 
 stop_gpu_monitor
+METAX_MONITOR_STOPPED=1
 exit "$BMK_EXIT"

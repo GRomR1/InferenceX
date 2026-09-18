@@ -1346,6 +1346,87 @@ fi
         assert identity.read_text() == "MX-SMI identity snapshot: 1 device\n"
 
 
+    def test_metax_normalization_empty_raw_and_truncated_tail(self, tmp_path):
+        """An empty raw stream validates as failed; a partial tail row is dropped."""
+        header = (
+            "timestamp,deviceId,dieId,deviceName,bdfId,power [W],"
+            "temperature.hotspot [C],utilization.GPU [%]"
+        )
+        full_row = "2026/9/15 21:02:33.385860,GPU#0,-,MXC500,0000:06:00.0,85.5,66.0,58"
+        partial_row = "2026/9/15 21:02:33.892721,GPU#0,-,MXC50"
+        empty_raw = tmp_path / "empty_raw.csv"
+        empty_raw.write_text("")
+        no_out = tmp_path / "never.csv"
+        metrics_raw = tmp_path / "gpu_metrics_raw.csv"
+        metrics_raw.write_text(f"{header}\n{full_row}\n{partial_row}")  # no trailing newline
+        metrics = tmp_path / "gpu_metrics.csv"
+        benchmark_lib = Path(__file__).parents[1] / "benchmarks/benchmark_lib.sh"
+        script = f"""
+source {str(benchmark_lib)!r}
+GPU_METRICS_CSV={str(metrics)!r}
+if _normalize_metax_gpu_metrics {str(empty_raw)!r} {str(no_out)!r}; then
+    echo "empty raw unexpectedly normalized" >&2
+    exit 1
+fi
+_repair_metax_gpu_metrics_tail
+_normalize_metax_gpu_metrics {str(metrics_raw)!r} {str(metrics)!r}
+"""
+        env = {
+            "PATH": "/usr/bin:/bin",
+            "PYTHONDONTWRITEBYTECODE": "1",
+        }
+        result = subprocess.run(
+            ["bash", "-c", script],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert not no_out.exists()
+        assert metrics.read_text().splitlines() == [
+            "timestamp,index,power_w",
+            "2026/9/15 21:02:33.385860,0,85.5",
+        ]
+
+
+class TestWaitForReady:
+    """No-supervision readiness polling must report timeout via return, not exit."""
+
+    def test_no_supervision_timeout_returns_1_under_errexit(self, tmp_path):
+        log = tmp_path / "server.log"
+        log.write_text("starting\n")
+        benchmark_lib = Path(__file__).parents[1] / "benchmarks/benchmark_lib.sh"
+        script = f"""
+source {str(benchmark_lib)!r}
+# The endpoint never answers; the stub keeps the wait bounded and fast.
+curl() {{ return 7; }}
+sleep() {{ command sleep 0.02; }}
+set -e
+if wait_for_ready --endpoint "http://127.0.0.1:9/health" \\
+    --log {str(log)!r} --no-supervision --timeout 1; then
+    echo "unexpected success" >&2
+    exit 1
+fi
+echo "returned-1"
+"""
+        env = {"PYTHONDONTWRITEBYTECODE": "1", "PATH": "/usr/bin:/bin"}
+        result = subprocess.run(
+            ["bash", "-c", script],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        # A bare `exit 1` inside the poller would have killed this script
+        # before `returned-1`; reaching it proves the return contract.
+        assert result.returncode == 0, result.stderr
+        assert "returned-1" in result.stdout
+        assert "Timed out waiting for http://127.0.0.1:9/health" in result.stderr
+
+
 # =============================================================================
 # Integration: multinode power aggregation patches the agg JSON
 # =============================================================================

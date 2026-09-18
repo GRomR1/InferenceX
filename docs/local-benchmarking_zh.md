@@ -160,7 +160,7 @@ Launcher 内固定服务器参数：`--host 0.0.0.0 --port 8888
 ```bash
 # OPENAI_API_KEY 仅在服务器带 --api-key 启动时需要
 EXISTING_SERVER_PORT=8011 \
-OPENAI_API_KEY=opencode-key \
+OPENAI_API_KEY=<your-api-key> \
 MODEL=<tokenizer 用的权重路径> \
 bash benchmarks/local/run_local_sweep.sh
 ```
