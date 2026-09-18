@@ -1258,6 +1258,174 @@ fi
         identity = json.loads((tmp_path / "gpu_metrics_identity.json").read_text())
         assert identity == {"gpu_data": []}
 
+    def test_start_stop_gpu_monitor_metax_lifecycle(self, tmp_path):
+        """The raw mx-smi stream is normalized to timestamp,index,power_w."""
+        fake_bin = tmp_path / "bin"
+        fake_bin.mkdir()
+        header = (
+            "timestamp,deviceId,dieId,deviceName,bdfId,power [W],"
+            "temperature.hotspot [C],utilization.GPU [%]"
+        )
+        row_85 = "2026/9/15 21:02:33.385860,GPU#0,-,MXC500,0000:06:00.0,85.5,66.0,58"
+        row_89 = "2026/9/15 21:02:33.892721,GPU#0,-,MXC500,0000:06:00.0,89.1,64.0,57"
+        fake_mx_smi = fake_bin / "mx-smi"
+        fake_mx_smi.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -e\n"
+            'if [[ "$*" == *"-o "* ]]; then\n'
+            '    out="$(echo "$*" | sed -n \'s/.*-o //p\')"\n'
+            f"    printf '%s\\n' {header!r} > \"$out\"\n"
+            "    while :; do\n"
+            f"        printf '%s\\n' {row_85!r} >> \"$out\"\n"
+            f"        printf '%s\\n' {row_89!r} >> \"$out\"\n"
+            "        sleep 0.01\n"
+            "    done\n"
+            "fi\n"
+            "printf 'MX-SMI identity snapshot: 1 device\\n'\n"
+        )
+        fake_mx_smi.chmod(0o755)
+        metrics = tmp_path / "gpu_metrics.csv"
+        raw = tmp_path / "gpu_metrics_raw.csv"
+        benchmark_lib = Path(__file__).parents[1] / "benchmarks/benchmark_lib.sh"
+        script = f"""
+source {str(benchmark_lib)!r}
+# Wait for observable pipeline output instead of a fixed sampling delay.
+sleep() {{
+    for _ in $(seq 1 500); do
+        if [[ -f {str(raw)!r} ]] && [[ $(wc -l < {str(raw)!r}) -ge 3 ]]; then
+            return 0
+        fi
+        command sleep 0.01
+    done
+    echo "metax monitor did not emit samples" >&2
+    exit 1
+}}
+start_gpu_monitor --output {str(metrics)!r} --interval 1
+monitor_pid=$GPU_MONITOR_PID
+stop_gpu_monitor
+if kill -0 "$monitor_pid" 2>/dev/null; then
+    echo "monitor survived stop_gpu_monitor" >&2
+    exit 1
+fi
+"""
+        env = {
+            "PATH": f"{fake_bin}:/usr/bin:/bin",
+            "PYTHONDONTWRITEBYTECODE": "1",
+        }
+
+        proc = subprocess.Popen(
+            ["bash", "-c", script],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        try:
+            _, stderr = proc.communicate(timeout=10)
+        finally:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            proc.communicate()
+
+        assert proc.returncode == 0, stderr
+        lines = metrics.read_text().splitlines()
+        assert lines[0] == "timestamp,index,power_w"
+        # Hand-computed: "GPU#0" collapses to index "0"; the power column
+        # passes through untouched.
+        data_rows = [line.split(",") for line in lines[1:] if line]
+        assert len(data_rows) >= 2
+        assert all(row[1] == "0" for row in data_rows)
+        assert {row[2] for row in data_rows} <= {"85.5", "89.1"}
+        assert "2026/9/15 21:02:33.385860,0,85.5" in {",".join(row) for row in data_rows}
+        # The raw sidecar is consumed, and the identity snapshot survives.
+        assert not raw.exists()
+        identity = tmp_path / "gpu_metrics_identity.txt"
+        assert identity.read_text() == "MX-SMI identity snapshot: 1 device\n"
+
+
+    def test_metax_normalization_empty_raw_and_truncated_tail(self, tmp_path):
+        """An empty raw stream validates as failed; a partial tail row is dropped."""
+        header = (
+            "timestamp,deviceId,dieId,deviceName,bdfId,power [W],"
+            "temperature.hotspot [C],utilization.GPU [%]"
+        )
+        full_row = "2026/9/15 21:02:33.385860,GPU#0,-,MXC500,0000:06:00.0,85.5,66.0,58"
+        partial_row = "2026/9/15 21:02:33.892721,GPU#0,-,MXC50"
+        empty_raw = tmp_path / "empty_raw.csv"
+        empty_raw.write_text("")
+        no_out = tmp_path / "never.csv"
+        metrics_raw = tmp_path / "gpu_metrics_raw.csv"
+        metrics_raw.write_text(f"{header}\n{full_row}\n{partial_row}")  # no trailing newline
+        metrics = tmp_path / "gpu_metrics.csv"
+        benchmark_lib = Path(__file__).parents[1] / "benchmarks/benchmark_lib.sh"
+        script = f"""
+source {str(benchmark_lib)!r}
+GPU_METRICS_CSV={str(metrics)!r}
+if _normalize_metax_gpu_metrics {str(empty_raw)!r} {str(no_out)!r}; then
+    echo "empty raw unexpectedly normalized" >&2
+    exit 1
+fi
+_repair_metax_gpu_metrics_tail
+_normalize_metax_gpu_metrics {str(metrics_raw)!r} {str(metrics)!r}
+"""
+        env = {
+            "PATH": "/usr/bin:/bin",
+            "PYTHONDONTWRITEBYTECODE": "1",
+        }
+        result = subprocess.run(
+            ["bash", "-c", script],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert not no_out.exists()
+        assert metrics.read_text().splitlines() == [
+            "timestamp,index,power_w",
+            "2026/9/15 21:02:33.385860,0,85.5",
+        ]
+
+
+class TestWaitForReady:
+    """No-supervision readiness polling must report timeout via return, not exit."""
+
+    def test_no_supervision_timeout_returns_1_under_errexit(self, tmp_path):
+        log = tmp_path / "server.log"
+        log.write_text("starting\n")
+        benchmark_lib = Path(__file__).parents[1] / "benchmarks/benchmark_lib.sh"
+        script = f"""
+source {str(benchmark_lib)!r}
+# The endpoint never answers; the stub keeps the wait bounded and fast.
+curl() {{ return 7; }}
+sleep() {{ command sleep 0.02; }}
+set -e
+if wait_for_ready --endpoint "http://127.0.0.1:9/health" \\
+    --log {str(log)!r} --no-supervision --timeout 1; then
+    echo "unexpected success" >&2
+    exit 1
+fi
+echo "returned-1"
+"""
+        env = {"PYTHONDONTWRITEBYTECODE": "1", "PATH": "/usr/bin:/bin"}
+        result = subprocess.run(
+            ["bash", "-c", script],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        # A bare `exit 1` inside the poller would have killed this script
+        # before `returned-1`; reaching it proves the return contract.
+        assert result.returncode == 0, result.stderr
+        assert "returned-1" in result.stdout
+        assert "Timed out waiting for http://127.0.0.1:9/health" in result.stderr
+
 
 # =============================================================================
 # Integration: multinode power aggregation patches the agg JSON

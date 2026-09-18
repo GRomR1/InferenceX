@@ -8018,3 +8018,16 @@
     - "配置键由 dsv4-fp4-mi355x-sglang-disagg-agentic-hicache-mtp 改名为 dsv4-fp4-mi355x-sglang-disagg-agentic-umbp-dspark，以反映 DSpark 算法与 UMBP-linker 分支；该配方此前的条目仍记录在旧键名下。改名不伴随任何其他字段变化。"
     - "Collect completed logs from every Slurm node so both prefill and decode artifacts are uploaded; forward workflow-owned AgentX fast-mode and power inputs, and supply the existing router port to evaluation."
   pr-link: https://github.com/SemiAnalysisAI/InferenceX/pull/3188
+
+- config-keys:
+    - qwen3.8-int8-metax-c500-vllm
+  description:
+    - "Add a fully local (air-gapped, no GHA/Slurm, no server upload) fixed-sequence vLLM benchmark for Qwen3.8-27B W8A8 (INT8) on MetaX C500, TP1"
+    - "New standalone launcher benchmarks/single_node/fixed_seq_len/qwen3.8_int8_c500.sh plus the benchmarks/local/run_local_sweep.sh orchestrator; not registered in any CI master config or configs/runners.yaml, so existing CI behavior is unchanged"
+    - "Extend start_gpu_monitor/stop_gpu_monitor in benchmarks/benchmark_lib.sh with an mx-smi (MetaX) power branch normalized to timestamp,index,power_w; the existing nvidia-smi/amd-smi paths are untouched"
+    - "Bound the readiness /health probe to the remaining wait window in wait_for_ready (--max-time), so an unresponsive external server cannot hang the launcher"
+    - "为 MetaX C500 新增完全本地（离线、无 GHA/Slurm、不上传服务器）的固定序列 vLLM 基准：Qwen3.8-27B W8A8（INT8）、TP1"
+    - "新增独立 launcher 与本地编排脚本；未注册进任何 CI master config 或 configs/runners.yaml，现有 CI 行为不变"
+    - "benchmarks/benchmark_lib.sh 的 start_gpu_monitor/stop_gpu_monitor 新增 mx-smi（MetaX）功耗分支，归一化为 timestamp,index,power_w；原 nvidia-smi/amd-smi 路径不变"
+    - "wait_for_ready 的就绪 /health 探测受剩余等待窗口约束（--max-time），无响应的外部服务器不会再挂起 launcher"
+  pr-link: https://github.com/GRomR1/InferenceX/pull/1

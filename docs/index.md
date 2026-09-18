@@ -21,6 +21,7 @@ This is the mandatory low-context router for InferenceX work. Pick the one page 
 | [`eval-agentx-procedures.md`](./eval-agentx-procedures.md) / [`eval-agentx-procedures_zh.md`](./eval-agentx-procedures_zh.md) | Eval and AgentX selection, execution, scoring, evidence, and live-run diagnosis |
 | [`results-and-ingestion.md`](./results-and-ingestion.md) / [`results-and-ingestion_zh.md`](./results-and-ingestion_zh.md) | Published-result lookup, artifact identities and schemas, app ingestion, dedupe, and provenance |
 | [`recovery-results-procedures.md`](./recovery-results-procedures.md) / [`recovery-results-procedures_zh.md`](./recovery-results-procedures_zh.md) | Result processing, ingest verification and recovery, runner cleanup, and failure classification |
+| [`local-benchmarking.md`](./local-benchmarking.md) / [`local-benchmarking_zh.md`](./local-benchmarking_zh.md) | Local (air-gapped) fixed-sequence benchmarking on vendor accelerators, artifacts, and offline comparison against published baselines |
 | [`testing.md`](./testing.md) / [`testing_zh.md`](./testing_zh.md) | Local checks, smoke runs, evidence standards, and review gates |
 | [`troubleshooting.md`](./troubleshooting.md) / [`troubleshooting_zh.md`](./troubleshooting_zh.md) | Failure-layer diagnosis, known cases, safe remediation, and stop conditions |
 | [`documentation-procedures.md`](./documentation-procedures.md) / [`documentation-procedures_zh.md`](./documentation-procedures_zh.md) | Adding, translating, indexing, reviewing, and maintaining documentation |

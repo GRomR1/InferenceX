@@ -425,7 +425,8 @@ GPU_METRICS_CSV="${GPU_METRICS_CSV:-gpu_metrics.csv}"
 NVIDIA_GPU_MONITOR_QUERY="timestamp,index,power.draw,temperature.gpu,clocks.current.sm,clocks.current.memory,utilization.gpu,utilization.memory"
 export GPU_METRICS_CSV
 
-# Background nvidia-smi/amd-smi sampler writing CSV.
+# Start background GPU monitoring that logs metrics every second to CSV.
+# Auto-detects NVIDIA (nvidia-smi), AMD (amd-smi), or MetaX (mx-smi) GPUs.
 # Usage: start_gpu_monitor [--output /path/to/output.csv] [--interval 1]
 start_gpu_monitor() {
     local output="$GPU_METRICS_CSV"
@@ -468,23 +469,41 @@ start_gpu_monitor() {
         _write_amd_smi_sidecar "${output%.csv}_energy_start.csv" metric -E --csv
         _write_amd_smi_sidecar "${output%.csv}_identity.json" static --json
         echo "[GPU Monitor] Started AMD (PID=$GPU_MONITOR_PID, interval=${interval}s, output=$output)"
+    elif command -v mx-smi &>/dev/null; then
+        GPU_MONITOR_VENDOR="metax"
+        # mx-smi only streams to a file (-o) and -l takes milliseconds; -t is
+        # not allowed together with -o. The native header (deviceId, "power
+        # [W]") is not understood by the power aggregator, so the stream lands
+        # in a raw sidecar that stop_gpu_monitor normalizes to
+        # timestamp,index,power_w before the benchmark result is written.
+        mx-smi --show-board-power --show-temperature --show-usage \
+            -l "$(( interval * 1000 ))" -o "${output%.csv}_raw.csv" >/dev/null 2>&1 &
+        GPU_MONITOR_PID=$!
+        # Static identity snapshot for audit; the power pipeline never reads it.
+        mx-smi > "${output%.csv}_identity.txt" 2>/dev/null || rm -f "${output%.csv}_identity.txt"
+        echo "[GPU Monitor] Started MetaX (PID=$GPU_MONITOR_PID, interval=${interval}s, output=$output)"
     else
         GPU_MONITOR_VENDOR=""
-        echo "[GPU Monitor] No GPU monitoring tool found (nvidia-smi or amd-smi), skipping"
+        echo "[GPU Monitor] No GPU monitoring tool found (nvidia-smi, amd-smi, or mx-smi), skipping"
         return 0
     fi
 }
 
 stop_gpu_monitor() {
     if [[ -n "$GPU_MONITOR_PID" ]] && kill -0 "$GPU_MONITOR_PID" 2>/dev/null; then
-        # The stream must cover one sample past benchmark_end_time_unix for
-        # boundary interpolation. NVIDIA appends a one-shot sample below; amd-smi
-        # one-shot CSV has no timestamp column, so the AMD watch stream must emit
-        # final ticks before the kill. Two extra intervals because amd-smi stamps
-        # integer seconds: a tick in the same second as the window end still
-        # fails bracketing (MI355X: end=...153.325 vs last sample ...153.0).
-        if [[ "$GPU_MONITOR_VENDOR" == "amd" ]]; then
-            sleep $(( ${GPU_MONITOR_INTERVAL} + 2 ))
+        # benchmark_end_time_unix is recorded shortly before the benchmark
+        # process exits, so the stream must cover one more sample past it for
+        # deterministic boundary interpolation. NVIDIA appends a one-shot
+        # post-exit sample below; amd-smi one-shot CSV has no timestamp column,
+        # so the AMD path instead lets the watch stream emit final ticks before
+        # the kill. Two extra intervals: amd-smi stamps integer seconds, so a
+        # tick in the same second as the window end still fails bracketing —
+        # the stream needs a tick at the NEXT whole second (measured on MI355X:
+        # end=...153.325 vs last sample ...153.0).
+        # AMD and MetaX stamp wall-clock seconds; a final tick must land after
+        # the window end, so let the stream emit one more interval before kill.
+        if [[ "$GPU_MONITOR_VENDOR" == "amd" || "$GPU_MONITOR_VENDOR" == "metax" ]]; then
+            sleep $(( ${GPU_MONITOR_INTERVAL:-1} + 2 ))
         fi
         kill "$GPU_MONITOR_PID" 2>/dev/null
         wait "$GPU_MONITOR_PID" 2>/dev/null || true
@@ -499,6 +518,12 @@ stop_gpu_monitor() {
             amd)
                 _repair_truncated_gpu_metrics_tail || true
                 _write_amd_smi_sidecar "${GPU_METRICS_CSV%.csv}_energy_end.csv" metric -E --csv
+                ;;
+            metax)
+                _repair_metax_gpu_metrics_tail
+                _normalize_metax_gpu_metrics "${GPU_METRICS_CSV%.csv}_raw.csv" "$GPU_METRICS_CSV" ||
+                    echo "[GPU Monitor] Warning: MetaX metrics normalization failed" >&2
+                rm -f "${GPU_METRICS_CSV%.csv}_raw.csv"
                 ;;
         esac
         echo "[GPU Monitor] Stopped (PID=$GPU_MONITOR_PID)"
@@ -530,6 +555,24 @@ _repair_truncated_gpu_metrics_tail() {
     return 0
 }
 
+# Drop a partial trailing row from the raw metax telemetry when the monitor
+# dies mid-write; the normalized stream is only ever rewritten from this file.
+_repair_metax_gpu_metrics_tail() {
+    local raw_metrics="${GPU_METRICS_CSV%.csv}_raw.csv"
+    local repaired_metrics="${raw_metrics}.repair.$$"
+    if [[ -s "$raw_metrics" ]] &&
+        ! tail -c 1 "$raw_metrics" | grep -q '^$'; then
+        if sed '$d' "$raw_metrics" > "$repaired_metrics" &&
+            mv "$repaired_metrics" "$raw_metrics"; then
+            echo "[GPU Monitor] Dropped truncated trailing sample"
+        else
+            rm -f "$repaired_metrics"
+            echo "[GPU Monitor] Warning: could not repair truncated metax sample" >&2
+        fi
+    fi
+    return 0
+}
+
 # Write one best-effort amd-smi snapshot; remove the file rather than keep a
 # partial one when the invocation fails.
 _write_amd_smi_sidecar() {
@@ -541,13 +584,55 @@ _write_amd_smi_sidecar() {
     fi
 }
 
-# Poll rocm-smi VRAM% every 10s for up to 15 min until the busiest GPU is at or
-# below the threshold percent (default 10); return 1 otherwise so the caller
-# aborts instead of starting on GPUs still draining the previous job.
-# Pass a stricter threshold when the run sizes its KV cache from device-wide free
-# memory (torch.cuda.mem_get_info): on 288 GB parts the 10% gate admits ~28.8 GB
-# of residual, which the engine folds into non_torch and subtracts from the KV
-# pool, so the pool drifts run to run.
+# Rewrite the raw mx-smi stream as timestamp,index,power_w so the generic power
+# aggregator's header detection (time/power/gpu-index columns) matches.
+_normalize_metax_gpu_metrics() {
+    local raw_metrics="$1"
+    local output="$2"
+    if [[ ! -s "$raw_metrics" ]]; then
+        return 1
+    fi
+    python3 - "$raw_metrics" "$output" <<'PY'
+import csv
+import sys
+
+raw_path, out_path = sys.argv[1], sys.argv[2]
+with open(raw_path, newline="", encoding="utf-8", errors="replace") as f:
+    reader = csv.reader(f)
+    header = next(reader, None)
+    if header is None:
+        raise ValueError("empty raw metax telemetry")
+    timestamp_i = header.index("timestamp")
+    device_i = header.index("deviceId")
+    power_i = next(
+        (i for i, name in enumerate(header) if name.lower().startswith("power")), None
+    )
+    if power_i is None:
+        raise ValueError("no power column in metax telemetry header")
+    last = max(timestamp_i, device_i, power_i)
+    with open(out_path, "w", newline="", encoding="utf-8") as out:
+        writer = csv.writer(out)
+        writer.writerow(["timestamp", "index", "power_w"])
+        for row in reader:
+            if len(row) <= last:
+                continue
+            writer.writerow(
+                [row[timestamp_i], row[device_i].rsplit("#", 1)[-1], row[power_i]]
+            )
+PY
+}
+
+# Block until the GPUs have released a prior job's memory before starting a run.
+# Polls rocm-smi VRAM% every 10s for up to 15 minutes; succeeds once the busiest
+# GPU is at <= the threshold percent VRAM (default 10), otherwise returns 1 so the
+# caller aborts rather than starting a benchmark on GPUs still draining the
+# previous run's memory.
+#
+# Pass a stricter threshold when the run sizes its KV cache from the device-wide
+# free memory (torch.cuda.mem_get_info): on the 288 GB parts the default 10% gate
+# still admits ~28.8 GB of prior-job residual, which the engine then counts as
+# used, folds into its non_torch term, and subtracts from the KV pool -- so the
+# pool drifts run to run by whatever slipped under the gate.
 wait_for_amd_gpu_clean() {
     local threshold="${1:-10}"
     local gpu_clean=false vram_max i
@@ -636,7 +721,8 @@ EOF
 
 
 # Poll an HTTP endpoint while streaming the owning process log.
-# Required: --endpoint, --log, --pid. A zero timeout waits indefinitely.
+# Required: --endpoint, --log, and --pid unless --no-supervision is given.
+# A zero timeout waits indefinitely (only legal when a pid is supervised).
 wait_for_ready() {
     set +x
     local endpoint=""
@@ -644,6 +730,7 @@ wait_for_ready() {
     local process_pid=""
     local sleep_interval=5
     local timeout=0
+    local supervise=1
 
     while [[ $# -gt 0 ]]; do
         case $1 in
@@ -667,6 +754,10 @@ wait_for_ready() {
                 timeout="$2"
                 shift 2
                 ;;
+            --no-supervision)
+                supervise=0
+                shift
+                ;;
             *)
                 echo "Unknown parameter: $1"
                 return 1
@@ -682,8 +773,12 @@ wait_for_ready() {
         echo "Error: --log is required"
         return 1
     fi
-    if [[ -z "$process_pid" ]]; then
-        echo "Error: --pid is required"
+    if [[ "$supervise" -eq 1 && -z "$process_pid" ]]; then
+        echo "Error: --pid is required unless --no-supervision is given"
+        return 1
+    fi
+    if [[ "$supervise" -eq 0 && "$timeout" -eq 0 ]]; then
+        echo "Error: --no-supervision requires a positive --timeout"
         return 1
     fi
     if [[ ! "$sleep_interval" =~ ^[1-9][0-9]*$ ]]; then
@@ -699,23 +794,45 @@ wait_for_ready() {
     if [[ "$timeout" -gt 0 ]]; then
         deadline=$((SECONDS + timeout))
     fi
+    local probe_args=()
+    local remaining=0
+    # A single probe must not outlive the readiness budget: a server that
+    # accepts the connection and never answers must still be bounded.
+    _refresh_probe_args() {
+        probe_args=()
+        if [[ "$deadline" -gt 0 ]]; then
+            remaining=$(( deadline - SECONDS ))
+            if [[ "$remaining" -lt 1 ]]; then
+                remaining=1
+            fi
+            probe_args=(--max-time "$remaining")
+        else
+            probe_args=(--max-time "$sleep_interval")
+        fi
+    }
+    _refresh_probe_args
 
     while [[ ! -f "$process_log" ]]; do
-        if ! kill -0 "$process_pid" 2>/dev/null; then
+        if [[ "$supervise" -eq 1 ]] && ! kill -0 "$process_pid" 2>/dev/null; then
             echo "Process died before creating $process_log." >&2
             exit 1
         fi
         if [[ "$deadline" -gt 0 && "$SECONDS" -ge "$deadline" ]]; then
             echo "Timed out waiting for $endpoint." >&2
-            exit 1
+            # Supervised callers rely on the exit; no-supervision callers
+            # (externally owned servers) want a plain return like validation.
+            if [[ "$supervise" -eq 1 ]]; then
+                exit 1
+            fi
+            return 1
         fi
         sleep 1
     done
 
     tail -f -n +1 "$process_log" &
     local tail_pid=$!
-    until curl --output /dev/null --silent --fail "$endpoint"; do
-        if ! kill -0 "$process_pid" 2>/dev/null; then
+    until curl --output /dev/null --silent --fail "${probe_args[@]}" "$endpoint"; do
+        if [[ "$supervise" -eq 1 ]] && ! kill -0 "$process_pid" 2>/dev/null; then
             echo "Process died before $endpoint became ready." >&2
             kill "$tail_pid" 2>/dev/null || true
             exit 1
@@ -723,9 +840,14 @@ wait_for_ready() {
         if [[ "$deadline" -gt 0 && "$SECONDS" -ge "$deadline" ]]; then
             echo "Timed out waiting for $endpoint." >&2
             kill "$tail_pid" 2>/dev/null || true
-            exit 1
+            if [[ "$supervise" -eq 1 ]]; then
+                exit 1
+            fi
+            return 1
         fi
         sleep "$sleep_interval"
+        # Rebound the next probe to the (possibly shrunk) wait budget.
+        _refresh_probe_args
     done
     kill "$tail_pid" 2>/dev/null || true
     wait "$tail_pid" 2>/dev/null || true
@@ -736,6 +858,8 @@ wait_for_server_ready() {
     local server_log=""
     local server_pid=""
     local sleep_interval=5
+    local timeout=0
+    local no_supervision=0
 
     while [[ $# -gt 0 ]]; do
         case $1 in
@@ -743,20 +867,38 @@ wait_for_server_ready() {
             --server-log) server_log="$2"; shift 2 ;;
             --server-pid) server_pid="$2"; shift 2 ;;
             --sleep-interval) sleep_interval="$2"; shift 2 ;;
+            --timeout) timeout="$2"; shift 2 ;;
+            --no-supervision) no_supervision=1; shift ;;
             *) echo "Unknown parameter: $1"; return 1 ;;
         esac
     done
 
-    if [[ -z "$port" || -z "$server_log" || -z "$server_pid" ]]; then
-        echo "Error: --port, --server-log, and --server-pid are required"
+    if [[ -z "$port" || -z "$server_log" ]]; then
+        echo "Error: --port and --server-log are required"
+        return 1
+    fi
+    if [[ "$no_supervision" -eq 0 && -z "$server_pid" ]]; then
+        echo "Error: --server-pid is required unless --no-supervision is given"
         return 1
     fi
 
-    wait_for_ready \
-        --endpoint "http://0.0.0.0:${port}/health" \
-        --log "$server_log" \
-        --pid "$server_pid" \
-        --sleep-interval "$sleep_interval" || return $?
+    local ready_args=(
+        --endpoint "http://0.0.0.0:${port}/health"
+        --log "$server_log"
+        --sleep-interval "$sleep_interval"
+        --timeout "$timeout"
+    )
+    if [[ "$no_supervision" -eq 1 ]]; then
+        # The server's lifecycle is owned by the caller, so poll /health only.
+        ready_args+=(--no-supervision)
+    else
+        ready_args+=(--pid "$server_pid")
+    fi
+    wait_for_ready "${ready_args[@]}" || return $?
+    if [[ "$no_supervision" -eq 1 ]]; then
+        # No owned process to snapshot; run_server_client runs directly.
+        return 0
+    fi
     INFERENCEX_SERVER_STATE=$(mktemp /tmp/inferencex-server-state.XXXXXX) || return 1
     PYTHONPATH="$INFERENCEX_REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 -m infx.bench_serving.server_watch capture --pid "$server_pid" \
         > "$INFERENCEX_SERVER_STATE" || return 1
